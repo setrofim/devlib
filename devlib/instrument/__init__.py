@@ -16,6 +16,9 @@ from __future__ import division
 import csv
 import logging
 import collections
+import threading
+from csv import DictWriter
+from time import sleep
 
 from devlib.utils.types import numeric
 from devlib.utils.types import identifier
@@ -340,3 +343,86 @@ class Instrument(object):
 
     def get_raw(self):
         return []
+
+
+class InstrumentPoller(Instrument):
+
+    mode = CONTINUOUS
+
+    class PollerThread(threading.Thread):
+
+        def __init__(self, instrument, period, sleep_func):
+            super(PollerThread, self).__init__()
+            self.instrument = instrument
+            self.period = period
+            self.sleep_func = sleep_func
+            self.measurements = []
+            self._stop_signal_event = threading.Event()
+            self._has_stopped_event = threading.Event()
+            self._stop_signal_event.clear()
+            self._has_stopped_event.clear()
+
+        def run(self):
+            while not self._stop_signal_event.is_set():
+                self.measurements.append(self.instrument.take_measurement())
+                self.sleep_func(self.period)
+            self._has_stopped_event.set()
+
+        def stop(self):
+            self._stop_signal_event.set()
+
+        def wait(self):
+            self._has_stopped_event.wait()
+
+    def __init__(self, target, instrument_cls,
+                 period=2, sleep_on_target=False,
+                 *args, **kwargs):
+        Instrument.__init__(self, target)
+
+        if not (instrument_cls.mode & INSTANTANEOUS):
+            msg = 'Instrument "{}" does not support INSTANTANEOUS collection'
+            raise ValueError(msg.format(instrument_cls.name))
+
+        self.period = period
+        self.instrument = instrument_cls(target, *args, **kwargs)
+        self.sleep_func =  self.target.sleep if sleep_on_target else sleep
+        self.measurements = []
+
+    def list_channels(self):
+        return self.instrument.list_channels()
+
+    def get_channels(self, measure):
+        return self.instrument.get_channels(measure)
+
+    def add_channel(self, site, measure, **attrs):
+        self.instrument.add_channel(site, measure, **attrs)
+
+    def setup(self, *args, **kwargs):
+        self.instrument.setup(*args, **kwargs)
+
+    def teardown(self):
+        self.instrument.teardown()
+        if self.poller and self.poller.is_alive():
+            self.poller.stop()
+            self.poller.wait()
+
+    def reset(self, sites=None, kinds=None, channels=None):
+        self.instrument.reset(sites=sites, kinds=kinds, channels=channels)
+        self.poller = self.PollerThread(self.instrument, self.period, self.sleep_func)
+
+    def start(self):
+        self.poller.start()
+
+    def stop(self):
+        self.poller.stop()
+
+    def get_data(self, outfile):
+        self.poller.wait()
+        rows = [{m.name: m.value} for m in row for row in self.poller.measurements]
+        with open(outfile, 'w') as wfh:
+            writer = DictWriter(wfh, [chan.name for chan in
+                                      self.instrument.active_channels])
+            writer.writerows(rows)
+        return MeasurementsCsv(outfile, self.instrument.active_channels,
+                               1.0 / self.period)
+
